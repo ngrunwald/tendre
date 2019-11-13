@@ -92,11 +92,17 @@
          (when transaction-mine?
            (.abort trx)))))))
 
+
+(defprotocol TendreMapProtocol
+  (close [this] "Close the DB"))
+
 (deftype TendreMap [opts ^Environment env
                     label
                     key-encoder key-decoder
                     value-encoder value-decoder
                     metadata]
+  TendreMapProtocol
+  (close [this] (.close env))
   clojure.lang.ITransientMap
   (assoc [this k v] (do
                       (transactional-write
