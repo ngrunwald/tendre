@@ -283,6 +283,11 @@
               value-serializer edn-serializer}
          :as opts}]
   (let [env (open-environment path)]
+    (transactional-write
+                       env
+                       (fn [trx]
+                         (let [store (open-store env trx name)]
+                           )))
     (TendreMap. opts env name
                 (:encoder key-serializer) (:decoder key-serializer)
                 (:encoder value-serializer) (:decoder value-serializer)
