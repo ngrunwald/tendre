@@ -286,8 +286,7 @@
     (transactional-write
                        env
                        (fn [trx]
-                         (let [store (open-store env trx name)]
-                           )))
+                         (open-store env trx name)))
     (TendreMap. opts env name
                 (:encoder key-serializer) (:decoder key-serializer)
                 (:encoder value-serializer) (:decoder value-serializer)
