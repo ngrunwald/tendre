@@ -54,6 +54,27 @@
    :encoder #(StringBinding/stringToEntry (pr-str %))
    :name ::edn-serializer})
 
+(defmacro conditional-fn
+  [namespace & body]
+  (let [maybe-ex (try (require [namespace]) (catch Exception e e))]
+    (if (instance? Exception maybe-ex)
+      `(fn [v#] (throw (ex-info (format "Could not find class or file for ns %s" ~(str namespace))
+                               {:namespace ~(str namespace)})))
+      `(do
+         (require '[~namespace])
+         ~@body))))
+
+(def nippy-serialyzer
+  {:decoder (conditional-fn taoensso.nippy
+                            (fn nippy-decoder [v]
+                              (if (nil? v)
+                                v
+                                (taoensso.nippy/thaw v))))
+   :encoder (conditional-fn taoensso.nippy
+                            (fn nippy-encoder [v]
+                              (taoensso.nippy/freeze v)))
+   :name ::nippy-serializer})
+
 (defn make-transactional-executable
   [f]
   (reify TransactionalExecutable

@@ -6,4 +6,5 @@
   :dependencies [[org.clojure/clojure "1.10.1"]
                  [org.jetbrains.xodus/xodus-openAPI "1.3.124"]
                  [org.jetbrains.xodus/xodus-environment "1.3.124"]]
+  :profiles {:dev {:dependencies [[com.taoensso/nippy "2.14.0"]]}}
   :repl-options {:init-ns tendre.core})
