@@ -1,7 +1,39 @@
 (ns tendre.core-test
   (:require [clojure.test :refer :all]
-            [tendre.core :refer :all]))
+            [tendre.core :refer :all]
+            [testit.core :refer :all])
+  (:import [jetbrains.exodus.env Transaction]))
 
-(deftest a-test
-  (testing "FIXME, I fail."
-    (is (= 0 1))))
+(defn tmp-path
+  []
+  (str (System/getProperty "java.io.tmpdir") "/" (name (gensym "tendre-test-"))))
+
+(defn tail-recursive-delete
+  [& fs]
+  (when-let [f (first fs)]
+    (if-let [cs (seq (.listFiles (clojure.java.io/file f)))]
+      (recur (concat cs fs))
+      (do (clojure.java.io/delete-file f)
+          (recur (rest fs))))))
+
+(deftest isolation
+  (let [path (tmp-path)]
+    (try
+      (with-open [tm (make-map path {})]
+        (fact "empty map"
+             (into {} tm) => {})
+        (assoc! tm :foo 42)
+        (facts "assoc"
+               (tm :foo) => 42
+               (:foo tm) => 42
+               (get-transaction-type tm) => nil?)
+        (let [finished? (future
+                          (dotimes [n 1000]
+                            (update! tm :foo inc)))]
+          (dotimes [n 1000]
+            (update! tm :foo inc))
+          @finished?
+          (fact "transactions reconciled"
+                (tm :foo) => 2042)))
+      (finally
+          (tail-recursive-delete path)))))

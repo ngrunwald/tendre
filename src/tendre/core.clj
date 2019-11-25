@@ -10,12 +10,14 @@
            [jetbrains.exodus ByteIterable ArrayByteIterable]))
 
 (defprotocol TendreMapProtocol
-  (update! [this k f & args] "Atomically updates the DB with function f")
   (get-path [this] "Returns the path for this DB")
   (get-options [this] "Returns the options for this DB")
   (get-environment [this] "Returns the env for this DB")
-  (get-transaction [this] "Returns the active transaction if it exists")
+  (get-transaction-type [this] "Returns the type of the current transaction, or nil if none")
   (transact [this transaction] "Returns a version of the DB participating in a transaction"))
+
+(defprotocol TransactionalTendreMap
+  (get-transaction [tm transaction-type] "Returns a transaction if it already exists, else creates a new one"))
 
 (defn open-environment
   [path]
@@ -92,28 +94,27 @@
 
 (defn transactional-write
   ([env-or-trx f]
-   (let [[trx transaction-mine?] (cond
-                                   (instance? Transaction env-or-trx) [env-or-trx false]
-                                   (satisfies? TendreMapProtocol env-or-trx) [(begin-transaction (get-environment env-or-trx)) true]
-                                   :else [(begin-transaction env-or-trx) true])]
-     (try
-       (loop []
-         (f trx)
-         (if (.flush trx)
-           trx
-           (do
-             (.revert trx)
-             (recur))))
-       (finally
-         (when transaction-mine?
-           (.abort trx)))))))
+   (let [trx-type (when-not (instance? Environment env-or-trx)
+                    (get-transaction-type env-or-trx))]
+     (cond
+       (nil? trx-type) (let [[trx _] (get-transaction env-or-trx :read-write)]
+                         (try
+                           (loop []
+                             (f trx)
+                             (if (.flush trx)
+                               trx
+                               (do
+                                 (.revert trx)
+                                 (recur))))
+                           (finally
+                             (.abort trx))))
+       (= :read-only trx-type) (throw (ex-info "Cannot write from a :read-only transaction" {}))
+       :else (let [[trx _] (get-transaction env-or-trx trx-type)]
+               (f trx))))))
 
 (defn transactional-read
   ([env-or-trx f]
-   (let [[trx transaction-mine?] (cond
-                                   (instance? Transaction env-or-trx) [env-or-trx false]
-                                   (satisfies? TendreMapProtocol env-or-trx) [(begin-read-only-transaction (get-environment env-or-trx)) true]
-                                   :else [(begin-read-only-transaction env-or-trx) true])]
+   (let [[trx transaction-mine?] (get-transaction env-or-trx :read-only)]
      (try
        (f trx)
        (finally
@@ -124,15 +125,27 @@
   {:read-only {:begin begin-read-only-transaction
                :flush  (fn [^Transaction trx] (.abort trx) true)
                :revert (fn [^Transaction trx] (.abort trx) true)
-               :abort  (fn [^Transaction trx] (.abort trx) true)}
+               :abort  (fn [^Transaction trx] (.abort trx) true)
+               :predicate (fn [^Transaction trx] (.isReadonly trx))}
    :read-write {:begin begin-transaction
                 :flush  (fn [^Transaction trx] (.flush trx))
                 :revert (fn [^Transaction trx] (.revert trx))
-                :abort  (fn [^Transaction trx] (.commit trx))}
+                :abort  (fn [^Transaction trx] (.abort trx))
+                :predicate (fn [^Transaction trx] (and (not (.isReadonly trx))
+                                                       (not (.isExclusive trx))))}
    :exclusive {:begin begin-exclusive-transaction
                :flush  (fn [^Transaction trx] (.flush trx))
                :revert (fn [^Transaction trx] (.revert trx))
-               :abort  (fn [^Transaction trx] (.commit trx))}})
+               :abort  (fn [^Transaction trx] (.abort trx))
+               :predicate (fn [^Transaction trx] (.isExclusive trx))}})
+
+(extend-protocol TransactionalTendreMap
+  Transaction
+  (get-transaction [this transaction-type] [this false])
+  Environment
+  (get-transaction [this transaction-type]
+    (let [{:keys [begin]} (transaction-types transaction-type)]
+      [(begin this) true])))
 
 (defmacro with-transaction*
   [transaction bindings & body]
@@ -146,24 +159,25 @@
 
 (defmacro with-transaction-top*
   [trx-type bindings & body]
-  (let [{:keys [begin flush revert abort]} (transaction-types trx-type)
+  (let [{:keys [flush revert abort]} (transaction-types trx-type)
         [nam expr] (subvec bindings 0 2)]
     `(let [db# ~expr]
-       (if-let [external-trx# (get-transaction db#)]
-         (let [~nam db#]
-           (with-transaction* external-trx# ~(subvec bindings 2) ~@body))
-         (let [trx# (~begin (get-environment db#))
-               ~nam (transact db# trx#)]
-           (try
-             (loop []
-               (let [result# (with-transaction* trx# ~(subvec bindings 2) ~@body)]
-                 (if (~flush trx#)
-                   result#
-                   (do
-                     (~revert trx#)
-                     (recur)))))
-             (finally
-               (~abort trx#))))))))
+       (let [[trx# transaction-mine?#] (get-transaction db# ~trx-type)]
+         (if transaction-mine?#
+           (let [~nam (transact db# trx#)]
+             (try
+               (loop []
+                 (let [result# (with-transaction* trx# ~(subvec bindings 2) ~@body)]
+                   (if (~flush trx#)
+                     (do
+                       result#)
+                     (do
+                       (~revert trx#)
+                       (recur)))))
+               (finally
+                 (~abort trx#))))
+           (let [~nam db#]
+             (with-transaction* trx# ~(subvec bindings 2) ~@body)))))))
 
 (defmacro with-transaction
   [bindings & body]
@@ -174,11 +188,20 @@
   [^java.lang.AutoCloseable tm]
   (.close tm))
 
-(defn update! [this k f & args]
+(defn update!
+  [this k f & args]
   (with-transaction [tm this]
     (let [old-val (tm k)
           new-val (apply f old-val args)]
-      (assoc! this k new-val))))
+      (assoc! tm k new-val))))
+
+(defn find-transaction-type
+  [^Transaction trx]
+  (when (instance? Transaction trx)
+    (cond
+      (.isReadonly trx) :read-only
+      (.isExclusive trx) :exclusive
+      :else :read-write)))
 
 (defn update-in!
   [m ks f & args]
@@ -194,11 +217,21 @@
   (get-path [_] path)
   (get-options [_] opts)
   (get-environment [_] env)
-  (get-transaction [_] transaction)
+  (get-transaction-type [this] (find-transaction-type transaction))
   (transact [this transaction]
     (TendreMap. path opts env label key-encoder key-decoder
                 value-encoder value-decoder metadata
                 transaction (open-store env transaction label)))
+  TransactionalTendreMap
+  (get-transaction [_ transaction-type]
+    (cond
+      (let [actual-type (find-transaction-type transaction)]
+        (or (= actual-type transaction-type)
+            (and actual-type (= transaction-type :read-only)))) [transaction false]
+      transaction (throw (ex-info (format "Wrong type of transaction in progress, asked for %s but is %s"
+                                          transaction-type (find-transaction-type transaction))
+                                  {:transaction-type-asked transaction-type}))
+      :else (get-transaction env transaction-type)))
   clojure.lang.ITransientMap
   (assoc [this k v] (do
                       (transactional-write
