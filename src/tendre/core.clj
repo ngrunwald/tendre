@@ -6,9 +6,16 @@
             TransactionalExecutable TransactionalComputable
             StoreConfig Store]
            [jetbrains.exodus.bindings
-            StringBinding LongBinding DoubleBinding]
-           [jetbrains.exodus ByteIterable]))
+            StringBinding LongBinding DoubleBinding ByteBinding]
+           [jetbrains.exodus ByteIterable ArrayByteIterable]))
 
+(defprotocol TendreMapProtocol
+  (update! [this k f & args] "Atomically updates the DB with function f")
+  (get-path [this] "Returns the path for this DB")
+  (get-options [this] "Returns the options for this DB")
+  (get-environment [this] "Returns the env for this DB")
+  (get-transaction [this] "Returns the active transaction if it exists")
+  (transact [this transaction] "Returns a version of the DB participating in a transaction"))
 
 (defn open-environment
   [path]
@@ -59,20 +66,18 @@
   (let [maybe-ex (try (require [namespace]) (catch Exception e e))]
     (if (instance? Exception maybe-ex)
       `(fn [v#] (throw (ex-info (format "Could not find class or file for ns %s" ~(str namespace))
-                               {:namespace ~(str namespace)})))
+                                {:namespace ~(str namespace)})))
       `(do
          (require '[~namespace])
          ~@body))))
 
 (def nippy-serialyzer
   {:decoder (conditional-fn taoensso.nippy
-                            (fn nippy-decoder [v]
-                              (if (nil? v)
-                                v
-                                (taoensso.nippy/thaw v))))
+                            (fn nippy-decoder [^ByteIterable v]
+                              (taoensso.nippy/thaw (.getBytesUnsafe v))))
    :encoder (conditional-fn taoensso.nippy
                             (fn nippy-encoder [v]
-                              (taoensso.nippy/freeze v)))
+                              (ArrayByteIterable. (taoensso.nippy/freeze v))))
    :name ::nippy-serializer})
 
 (defn make-transactional-executable
@@ -87,103 +92,173 @@
 
 (defn transactional-write
   ([env-or-trx f]
-   (let [[trx transaction-mine?] (if (instance? Transaction env-or-trx)
-                                   [env-or-trx false]
-                                   [(begin-transaction env-or-trx) true])]
+   (let [[trx transaction-mine?] (cond
+                                   (instance? Transaction env-or-trx) [env-or-trx false]
+                                   (satisfies? TendreMapProtocol env-or-trx) [(begin-transaction (get-environment env-or-trx)) true]
+                                   :else [(begin-transaction env-or-trx) true])]
      (try
-      (loop []
-        (f trx)
-        (if (.flush trx)
-          trx
-          (do
-            (.revert trx)
-            (recur))))
-      (finally
-        (when transaction-mine?
-          (.abort trx)))))))
+       (loop []
+         (f trx)
+         (if (.flush trx)
+           trx
+           (do
+             (.revert trx)
+             (recur))))
+       (finally
+         (when transaction-mine?
+           (.abort trx)))))))
 
 (defn transactional-read
   ([env-or-trx f]
-   (let [[trx transaction-mine?] (if (instance? Transaction env-or-trx)
-                                   [env-or-trx false]
-                                   [(begin-read-only-transaction env-or-trx) true])]
+   (let [[trx transaction-mine?] (cond
+                                   (instance? Transaction env-or-trx) [env-or-trx false]
+                                   (satisfies? TendreMapProtocol env-or-trx) [(begin-read-only-transaction (get-environment env-or-trx)) true]
+                                   :else [(begin-read-only-transaction env-or-trx) true])]
      (try
        (f trx)
        (finally
          (when transaction-mine?
            (.abort trx)))))))
 
+(def transaction-types
+  {:read-only {:begin begin-read-only-transaction
+               :flush  (fn [^Transaction trx] (.abort trx) true)
+               :revert (fn [^Transaction trx] (.abort trx) true)
+               :abort  (fn [^Transaction trx] (.abort trx) true)}
+   :read-write {:begin begin-transaction
+                :flush  (fn [^Transaction trx] (.flush trx))
+                :revert (fn [^Transaction trx] (.revert trx))
+                :abort  (fn [^Transaction trx] (.commit trx))}
+   :exclusive {:begin begin-exclusive-transaction
+               :flush  (fn [^Transaction trx] (.flush trx))
+               :revert (fn [^Transaction trx] (.revert trx))
+               :abort  (fn [^Transaction trx] (.commit trx))}})
 
-(defprotocol TendreMapProtocol
-  (close [this] "Close the DB"))
+(defmacro with-transaction*
+  [transaction bindings & body]
+  (cond
+    (= (count bindings) 0) `(do ~@body)
+    (symbol? (bindings 0)) (let [[nam expr] (subvec bindings 0 2)]
+                             `(let [~nam (transact ~expr ~transaction)]
+                                (with-transaction* trx# ~(subvec bindings 2) ~@body)))
+    :else (throw (IllegalArgumentException.
+                   "with-transaction only allows Symbols in bindings"))))
 
-(deftype TendreMap [opts ^Environment env
+(defmacro with-transaction-top*
+  [trx-type bindings & body]
+  (let [{:keys [begin flush revert abort]} (transaction-types trx-type)
+        [nam expr] (subvec bindings 0 2)]
+    `(let [db# ~expr]
+       (if-let [external-trx# (get-transaction db#)]
+         (let [~nam db#]
+           (with-transaction* external-trx# ~(subvec bindings 2) ~@body))
+         (let [trx# (~begin (get-environment db#))
+               ~nam (transact db# trx#)]
+           (try
+             (loop []
+               (let [result# (with-transaction* trx# ~(subvec bindings 2) ~@body)]
+                 (if (~flush trx#)
+                   result#
+                   (do
+                     (~revert trx#)
+                     (recur)))))
+             (finally
+               (~abort trx#))))))))
+
+(defmacro with-transaction
+  [bindings & body]
+  `(with-transaction-top* :read-write ~bindings ~@body))
+
+
+(defn close!
+  [^java.lang.AutoCloseable tm]
+  (.close tm))
+
+(defn update! [this k f & args]
+  (with-transaction [tm this]
+    (let [old-val (tm k)
+          new-val (apply f old-val args)]
+      (assoc! this k new-val))))
+
+(defn update-in!
+  [m ks f & args]
+  (let [[top & left] ks]
+    (update! m top (fn [old] (update-in old left #(apply f % args))))))
+
+(deftype TendreMap [path opts ^Environment env
                     label
                     key-encoder key-decoder
                     value-encoder value-decoder
-                    metadata]
+                    metadata ^Transaction transaction ^Store store]
   TendreMapProtocol
-  (close [this] (.close env))
+  (get-path [_] path)
+  (get-options [_] opts)
+  (get-environment [_] env)
+  (get-transaction [_] transaction)
+  (transact [this transaction]
+    (TendreMap. path opts env label key-encoder key-decoder
+                value-encoder value-decoder metadata
+                transaction (open-store env transaction label)))
   clojure.lang.ITransientMap
   (assoc [this k v] (do
                       (transactional-write
-                       env
+                       this
                        (fn [trx]
-                         (let [store (open-store env trx label)]
-                           (.add store trx (key-encoder k) (value-encoder v)))))
+                         (let [store (or store (open-store env trx label))]
+                           (.put store trx (key-encoder k) (value-encoder v)))))
                       this))
   (without [this k] (do
                       (transactional-write
-                       env
+                       this
                        (fn [trx]
-                         (let [store (open-store env trx label)]
+                         (let [store (or store (open-store env trx label))]
                            (.delete store trx (key-encoder k)))))
                       this))
-  (valAt [_ k] (transactional-read
-                env
-                (fn [trx]
-                  (let [store (open-store env trx label)]
-                    (if-let [raw-v (.get store trx (key-encoder k))]
-                      (value-decoder raw-v)
-                      nil)))))
-  (valAt [_ k default] (transactional-read
-                        env
-                        (fn [trx]
-                          (let [store (open-store env trx label)]
-                            (if-let [raw-v (.get store trx (key-encoder k))]
-                              (value-decoder raw-v)
-                              default)))))
+  (valAt [this k] (transactional-read
+                   this
+                   (fn [trx]
+                     (let [store (or store (open-store env trx label))]
+                       (if-let [raw-v (.get store trx (key-encoder k))]
+                         (value-decoder raw-v)
+                         nil)))))
+  (valAt [this k default] (transactional-read
+                           this
+                           (fn [trx]
+                             (let [store (or store (open-store env trx label))]
+                               (if-let [raw-v (.get store trx (key-encoder k))]
+                                 (value-decoder raw-v)
+                                 default)))))
   (conj [this [k v]] (do
                        (transactional-write
-                        env
+                        this
                         (fn [trx]
-                          (let [store (open-store env trx label)]
-                            (.add store trx (key-encoder k) (value-encoder v)))))
+                          (let [store (or store (open-store env trx label))]
+                            (.put store trx (key-encoder k) (value-encoder v)))))
                        this))
-  (count [_] (transactional-read
-              env
-              (fn [trx]
-                (let [store (open-store env trx label)]
-                  (.count store trx)))))
+  (count [this] (transactional-read
+                 this
+                 (fn [trx]
+                   (let [store (or store (open-store env trx label))]
+                     (.count store trx)))))
   clojure.lang.ITransientAssociative2
-  (containsKey [_ k] (transactional-read
-                      env
-                      (fn [trx]
-                        (let [store (open-store env trx label)]
-                          (if (.get store trx (key-encoder k))
-                            true
-                            false)))))
+  (containsKey [this k] (transactional-read
+                         this
+                         (fn [trx]
+                           (let [store (or store (open-store env trx label))]
+                             (if (.get store trx (key-encoder k))
+                               true
+                               false)))))
   (entryAt [this k] (transactional-read
-                     env
+                     this
                      (fn [trx]
-                       (let [store (open-store env trx label)]
+                       (let [store (or store (open-store env trx label))]
                          (if-let [raw-v (.get store trx (key-encoder k))]
                            (clojure.lang.MapEntry. k (value-decoder raw-v))
                            nil)))))
   clojure.lang.Seqable
   (seq [this]
-    (let [trx (begin-read-only-transaction env)
-          store (open-store env trx label)
+    (let [[trx own-trx?] (if transaction [transaction false] [(begin-read-only-transaction env) true])
+          store (or store (open-store env trx label))
           cursor (.openCursor store trx)
           generator (fn lazy-gen [cursor]
                       (try
@@ -195,11 +270,11 @@
                             (lazy-gen cursor)))
                           (do
                             (.close cursor)
-                            (.abort trx)
+                            (when own-trx? (.abort trx))
                             nil))
                         (catch Exception e
                           (.close cursor)
-                          (.abort trx)
+                          (when own-trx? (.abort trx))
                           (throw e))))]
       (generator cursor)))
   clojure.lang.IFn
@@ -212,39 +287,39 @@
   ;; (resetMeta [_ m] (reset! metadata m))
   clojure.lang.IKVReduce
   (kvreduce [_ f init]
-    (let [trx (begin-read-only-transaction env)
-          store (open-store env trx label)]
+    (let [[trx own-trx?] (if transaction [transaction false] [(begin-read-only-transaction env) true])
+          store (or store (open-store env trx label))]
       (try
         (with-open [cursor (.openCursor store trx)]
-         (loop [ret init]
-           (if (.getNext cursor)
-             (let [ret* (f ret (key-decoder (.getKey cursor)) (value-decoder (.getValue cursor)))]
-               (if (reduced? ret*)
-                 @ret*
-                 (recur ret*)))
-             ret)))
+          (loop [ret init]
+            (if (.getNext cursor)
+              (let [ret* (f ret (key-decoder (.getKey cursor)) (value-decoder (.getValue cursor)))]
+                (if (reduced? ret*)
+                  @ret*
+                  (recur ret*)))
+              ret)))
         (finally
-          (.abort trx)))))
+          (when own-trx? (.abort trx))))))
   clojure.lang.IReduceInit
   (reduce [_ f init]
-    (let [trx (begin-read-only-transaction env)
-          store (open-store env trx label)]
+    (let [[trx own-trx?] (if transaction [transaction false] [(begin-read-only-transaction env) true])
+          store (or store (open-store env trx label))]
       (try
         (with-open [cursor (.openCursor store trx)]
-         (loop [ret init]
-           (if (.getNext cursor)
-             (let [ret* (f ret (clojure.lang.MapEntry. (key-decoder (.getKey cursor))
-                                                       (value-decoder (.getValue cursor))))]
-               (if (reduced? ret*)
-                 @ret*
-                 (recur ret*)))
-             ret)))
+          (loop [ret init]
+            (if (.getNext cursor)
+              (let [ret* (f ret (clojure.lang.MapEntry. (key-decoder (.getKey cursor))
+                                                        (value-decoder (.getValue cursor))))]
+                (if (reduced? ret*)
+                  @ret*
+                  (recur ret*)))
+              ret)))
         (finally
-          (.abort trx)))))
+          (when own-trx? (.abort trx))))))
   clojure.lang.IReduce
   (reduce [_ f]
-    (let [trx (begin-read-only-transaction env)
-          store (open-store env trx label)]
+    (let [[trx own-trx?] (if transaction [transaction false] [(begin-read-only-transaction env) true])
+          store (or store (open-store env trx label))]
       (try
         (with-open [cursor (.openCursor store trx)]
           (loop [ret nil]
@@ -256,8 +331,10 @@
                   (recur ret*)))
               ret)))
         (finally
-          (.abort trx)))))
+          (when own-trx? (.abort trx))))))
   clojure.lang.MapEquivalence
+  java.lang.AutoCloseable
+  (close [this] (.close (get-environment this)))
   ;; PTransactionable
   ;; (commit! [this] (.commit db) this)
   ;; (rollback! [this] (.rollback db) this)
@@ -305,10 +382,10 @@
          :as opts}]
   (let [env (open-environment path)]
     (transactional-write
-                       env
-                       (fn [trx]
-                         (open-store env trx name)))
-    (TendreMap. opts env name
+     env
+     (fn [trx]
+       (open-store env trx name)))
+    (TendreMap. path opts env name
                 (:encoder key-serializer) (:decoder key-serializer)
                 (:encoder value-serializer) (:decoder value-serializer)
-                {})))
+                {} nil nil)))
