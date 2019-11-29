@@ -36,4 +36,24 @@
           (fact "transactions reconciled"
                 (tm :foo) => 2042)))
       (finally
-          (tail-recursive-delete path)))))
+        (tail-recursive-delete path)))))
+
+(deftest transactions
+  (let [path (tmp-path)
+        tm (make-map path {})]
+    (try
+      (with-transaction [ttm tm]
+        (fact "empty map"
+              (into {} ttm) => {})
+        (fact "put 0"
+              (assoc! ttm :foo 0) => #(= (:foo %) 0))
+        (dotimes [n 1000]
+          (update! ttm :foo inc))
+        (fact "all written"
+              (ttm :foo) => 1000)
+        (fact "isolation preserved"
+              (tm :foo) => nil?))
+      (fact "closing works"
+            (close! tm) => (fn [_] true))
+      (finally
+        (tail-recursive-delete path)))))
