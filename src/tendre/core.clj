@@ -193,7 +193,8 @@
   (with-transaction [tm this]
     (let [old-val (tm k)
           new-val (apply f old-val args)]
-      (assoc! tm k new-val))))
+      (assoc! tm k new-val)))
+  this)
 
 (defn find-transaction-type
   [^Transaction trx]
