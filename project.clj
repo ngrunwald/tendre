@@ -9,7 +9,4 @@
   :profiles {:dev {:dependencies [[com.taoensso/nippy "2.14.0"]
                                   [metosin/testit "0.4.0"]
                                   [expound "0.8.0"]]}}
-  :repositories [["releases"  {:url "https://artifactory.oscaroad.com/artifactory/libs-release-local"}]
-                 ["snapshots" {:url "https://artifactory.oscaroad.com/artifactory/libs-snapshot-local"}]
-                 ["remote"    {:url "https://artifactory.oscaroad.com/artifactory/remote-repos"}]]
   :repl-options {:init-ns tendre.core})
