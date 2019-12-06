@@ -1,5 +1,6 @@
 (ns tendre.core
-  (:require [clojure.edn :as edn])
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str])
   (:import [jetbrains.exodus.env
             Environment Environments
             Transaction Cursor
@@ -62,6 +63,34 @@
   {:decoder #(edn/read-string (StringBinding/entryToString %))
    :encoder #(StringBinding/stringToEntry (pr-str %))
    :name ::edn-serializer})
+
+(def long-serializer
+  {:decoder #(LongBinding/entryToLong %)
+   :encoder #(LongBinding/longToEntry %)
+   :name ::long-serializer})
+
+(def double-serializer
+  {:decoder #(DoubleBinding/entryToDouble %)
+   :encoder #(DoubleBinding/doubleToEntry %)
+   :name ::double-serializer})
+
+(def unsigned-long-compressed-serializer
+  {:decoder #(LongBinding/compressedEntryToLong %)
+   :encoder #(LongBinding/longToCompressedEntry %)
+   :name ::unsigned-long-compressed-serializer})
+
+(def string-serializer
+  {:decoder #(StringBinding/entryToString %)
+   :encoder #(StringBinding/stringToEntry %)
+   :name ::string-serializer})
+
+(def keyword-serializer
+  {:decoder #(keyword (StringBinding/entryToString %))
+   :encoder #(StringBinding/stringToEntry
+              (if-let [nsp (namespace %)]
+                (str nsp "/" (name %))
+                (name %)))
+   :name ::keyword-serializer})
 
 (defmacro conditional-fn
   [namespace & body]
