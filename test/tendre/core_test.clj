@@ -53,6 +53,8 @@
               (ttm :foo) => 1000)
         (fact "isolation preserved"
               (tm :foo) => nil?))
+      -(fact "changes are persisted"
+             (tm :foo) => 1000)
       (fact "closing works"
             (close! tm) => (fn [_] true))
       (finally
