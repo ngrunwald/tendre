@@ -17,8 +17,21 @@
   (get-transaction-type [this] "Returns the type of the current transaction, or nil if none")
   (transact [this transaction] "Returns a version of the DB participating in a transaction"))
 
-(defprotocol TransactionalTendreMap
-  (get-transaction [tm transaction-type] "Returns a transaction if it already exists, else creates a new one"))
+(defprotocol TransactionalTendreProtocol
+  (get-transaction [tm transaction-type] "Returns a transaction if it already exists, else creates a new one")
+  (commit! [tm] "Commits the current transaction")
+  (revert! [tm])
+  (flush! [tm])
+  (abort! [tm])
+  (idempotent? [tm])
+  (read-only? [tm])
+  (exclusive? [tm])
+  (finished? [tm])
+  (transactional? [tm]))
+
+(defprotocol EnvTendreProtocol
+  (open-environment [this opts]
+    ))
 
 (defn open-environment
   [path]
@@ -168,9 +181,18 @@
                :abort  (fn [^Transaction trx] (.abort trx))
                :predicate (fn [^Transaction trx] (.isExclusive trx))}})
 
-(extend-protocol TransactionalTendreMap
+(extend-protocol TransactionalTendreProtocol
   Transaction
   (get-transaction [this transaction-type] [this false])
+  (commit! [this] (.commit this))
+  (revert! [this] (.revert this))
+  (flush! [this] (.flush this))
+  (abort! [this] (.abort this))
+  (idempotent? [this] (.isIdempotent this))
+  (read-only? [this] (.isReadonly this))
+  (exclusive? [this] (.isExclusive this))
+  (finished? [this] (.isFinished this))
+  (transactional? [this] true)
   Environment
   (get-transaction [this transaction-type]
     (let [{:keys [begin]} (transaction-types transaction-type)]
@@ -252,7 +274,7 @@
     (TendreMap. path opts env label key-encoder key-decoder
                 value-encoder value-decoder metadata
                 transaction (open-store env transaction label)))
-  TransactionalTendreMap
+  TransactionalTendreProtocol
   (get-transaction [_ transaction-type]
     (cond
       (let [actual-type (find-transaction-type transaction)]
@@ -262,6 +284,15 @@
                                           transaction-type (find-transaction-type transaction))
                                   {:transaction-type-asked transaction-type}))
       :else (get-transaction env transaction-type)))
+  (commit! [this] (.commit transaction))
+  (revert! [this] (.revert transaction))
+  (flush! [this] (.flush transaction))
+  (abort! [this] (.abort transaction))
+  (idempotent? [this] (.isIdempotent transaction))
+  (read-only? [this] (.isReadonly transaction))
+  (exclusive? [this] (.isExclusive transaction))
+  (finished? [this] (.isFinished transaction))
+  (transactional? [this] (and transaction))
   clojure.lang.ITransientMap
   (assoc [this k v] (do
                       (transactional-write
@@ -398,51 +429,21 @@
   clojure.lang.MapEquivalence
   java.lang.AutoCloseable
   (close [this] (.close ^Environment (get-environment this)))
-  ;; PTransactionable
-  ;; (commit! [this] (.commit db) this)
-  ;; (rollback! [this] (.rollback db) this)
-  ;; java.io.Closeable
-  ;; (close [_] (.close db))
-  ;; Iterable
-  ;; (iterator [_] (let [trx (map (fn [^java.util.Map$Entry entry]
-  ;;                                (clojure.lang.MapEntry. (key-decoder (.getKey entry))
-  ;;                                                        (value-decoder (.getValue entry)))))]
-  ;;                 (.iterator ^Iterable (eduction trx (iterator-seq (.. hm entrySet iterator))))))
-  ;; PMapDBTransient
-  ;; (get-db ^DB [_] db)
-  ;; (get-db-options [_] db-opts)
-  ;; (get-db-type [_] (:db-type db-opts))
-  ;; (get-collection ^HTreeMap [_] hm)
-  ;; (get-collection-options [_] hm-opts)
-  ;; (get-wrapper-serializers [_] {:key-encoder key-encoder
-  ;;                               :key-decoder key-decoder
-  ;;                               :value-encoder value-encoder
-  ;;                               :value-decoder value-decoder})
-  ;; PMapDBPersistent
-  ;; (get-collection-name [_] hm-name)
-  ;; (get-collection-type [_] :hash-map)
-  ;; (compact! [this] (.. db getStore compact) this)
-  ;; (empty! [this] (empty! this false))
-  ;; (empty! [this notify-listener?]
-  ;;   (if notify-listener?
-  ;;     (.clearWithExpire hm)
-  ;;     (.clearWithoutNotification hm))
-  ;;   this)
-  ;; clojure.lang.IDeref
-  ;; (deref [_] (let [^java.util.Iterator iter (.. hm entrySet iterator)]
-  ;;              (loop [ret (transient {})]
-  ;;                (if (.hasNext iter)
-  ;;                  (let [^java.util.Map$Entry kv (.next iter)]
-  ;;                    (recur (assoc! ret (key-decoder (.getKey kv)) (value-decoder (.getValue kv)))))
-  ;;                  (persistent! ret)))))
-  )
+  clojure.lang.IDeref
+  (deref [this]
+    (persistent!
+     (reduce
+      (fn [acc [k v]]
+        (assoc! acc k v))
+      (transient {}) this))))
 
 (defn make-map
-  [path {:keys [name key-serializer value-serializer]
-         :or {name "default-clj-map"
-              key-serializer edn-serializer
-              value-serializer edn-serializer}
-         :as opts}]
+  [path
+   {:keys [name key-serializer value-serializer]
+    :or {name "default-clj-map"
+         key-serializer edn-serializer
+         value-serializer edn-serializer}
+    :as opts}]
   (let [env (open-environment path)]
     (transactional-write
      env
