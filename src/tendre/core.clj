@@ -262,6 +262,22 @@
   (let [[top & left] ks]
     (update! m top (fn [old] (update-in old left #(apply f % args))))))
 
+(defn into!
+  ([to xform from]
+   (transduce
+    xform
+    (completing
+     (fn [acc [k v]]
+       (assoc! acc k v)))
+    to from))
+  ([to from]
+   (reduce
+    (fn [acc [k v]]
+      (assoc! acc k v))
+    to from))
+  ([to] to)
+  ([] (transient {})))
+
 (deftype TendreMap [path opts ^Environment env
                     label
                     key-encoder key-decoder

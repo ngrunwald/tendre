@@ -82,6 +82,17 @@
               (tm2 :bar) => nil?)
       (facts "closing works"
              (close! tm1) => any
-             (close! tm1) => any)
+             (close! tm2) => any)
+      (finally
+        (tail-recursive-delete path)))))
+
+(deftest into
+  (let [path (tmp-path)
+        tm (make-map (clojure.java.io/file path) {})]
+    (try
+      (facts
+       (persistent! (into!)) => {}
+       @(into! tm {:foo "bar"}) =in=> {:foo "bar"}
+       @(into! tm (map (fn [[k v]] [k (inc v)])) {:baz 0}) =in=> {:baz 1})
       (finally
         (tail-recursive-delete path)))))
