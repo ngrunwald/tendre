@@ -1,13 +1,12 @@
 (ns tendre.core
-  (:require [clojure.edn :as edn]
-            [clojure.string :as str])
+  (:require [clojure.edn :as edn])
   (:import [jetbrains.exodus.env
             Environment Environments
             Transaction Cursor
             TransactionalExecutable TransactionalComputable
             StoreConfig Store]
            [jetbrains.exodus.bindings
-            StringBinding LongBinding DoubleBinding ByteBinding]
+            StringBinding LongBinding DoubleBinding]
            [jetbrains.exodus ByteIterable ArrayByteIterable]))
 
 (defprotocol TendreMapProtocol
@@ -30,12 +29,7 @@
   (transactional? [tm]))
 
 (defprotocol EnvTendreProtocol
-  (open-environment [this opts]
-    ))
-
-(defn open-environment
-  [path]
-  (Environments/newInstance path))
+  (open-environment [this opts] "Opens an Environment"))
 
 (def store-config
   {:with-duplicates-with-prefixing    StoreConfig/WITH_DUPLICATES_WITH_PREFIXING
@@ -181,6 +175,14 @@
                :abort  (fn [^Transaction trx] (.abort trx))
                :predicate (fn [^Transaction trx] (.isExclusive trx))}})
 
+(extend-protocol EnvTendreProtocol
+  String
+  (open-environment [path _] (Environments/newInstance path))
+  Environment
+  (open-environment [this _] this)
+  java.io.File
+  (open-environment [path _] (Environments/newInstance path)))
+
 (extend-protocol TransactionalTendreProtocol
   Transaction
   (get-transaction [this transaction-type] [this false])
@@ -219,14 +221,14 @@
              (try
                (loop []
                  (let [result# (with-transaction* trx# ~(subvec bindings 2) ~@body)]
-                   (if (~flush trx#)
-                     (do
-                       result#)
+                   (if (or (finished? trx#) (~flush trx#))
+                     result#
                      (do
                        (~revert trx#)
                        (recur)))))
                (finally
-                 (~abort trx#))))
+                 (when-not (finished? trx#)
+                   (~abort trx#)))))
            (let [~nam db#]
              (with-transaction* trx# ~(subvec bindings 2) ~@body)))))))
 
@@ -274,6 +276,8 @@
     (TendreMap. path opts env label key-encoder key-decoder
                 value-encoder value-decoder metadata
                 transaction (open-store env transaction label)))
+  EnvTendreProtocol
+  (open-environment [_ _] env)
   TransactionalTendreProtocol
   (get-transaction [_ transaction-type]
     (cond
@@ -444,7 +448,7 @@
          key-serializer edn-serializer
          value-serializer edn-serializer}
     :as opts}]
-  (let [env (open-environment path)]
+  (let [env (open-environment path {})]
     (transactional-write
      env
      (fn [trx]

@@ -46,7 +46,7 @@
         (fact "empty map"
               (into {} ttm) => {})
         (fact "put 0"
-              (assoc! ttm :foo 0) => #(= (:foo %) 0))
+              @(assoc! ttm :foo 0) =in=> {:foo 0})
         (dotimes [n 1000]
           (update! ttm :foo inc))
         (fact "all written"
@@ -56,6 +56,32 @@
       -(fact "changes are persisted"
              (tm :foo) => 1000)
       (fact "closing works"
-            (close! tm) => (fn [_] true))
+            (close! tm) => any)
+      (finally
+        (tail-recursive-delete path)))))
+
+(deftest multi-transactions
+  (let [path (tmp-path)
+        tm1 (make-map path {:name "tm1"})
+        tm2 (make-map tm1 {:name "tm2"})]
+    (try
+      (with-transaction [ttm1 tm1
+                         ttm2 tm2]
+        (facts "empty map"
+               (into {} ttm1) => {}
+               (empty? ttm2) => true)
+        (facts "put 0 and 1"
+               @(assoc! ttm1 :foo 0) =in=> {:foo 0}
+               @(assoc! ttm2 :bar (inc (:foo ttm1))) =in=> {:bar 1})
+        (facts "isolation preserved"
+               (tm1 :foo) => nil?
+               (tm2 :bar) => nil?)
+        (abort! ttm2))
+      -(facts "changes are not persisted"
+              (tm1 :foo) => nil?
+              (tm2 :bar) => nil?)
+      (facts "closing works"
+             (close! tm1) => any
+             (close! tm1) => any)
       (finally
         (tail-recursive-delete path)))))
