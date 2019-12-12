@@ -96,3 +96,14 @@
        @(into! tm (map (fn [[k v]] [k (inc v)])) {:baz 0}) =in=> {:baz 1})
       (finally
         (tail-recursive-delete path)))))
+
+(deftest stores
+  (let [path (tmp-path)
+        tm1 (make-map path {:name "test-store1"})
+        tm2 (make-map tm1 {:name "test-store2"})]
+    (try
+      (facts
+       (get-store-names tm1) => #{"test-store1" "test-store2"}
+       (get-store-names tm1) => #{"test-store1" "test-store2"})
+      (finally
+        (tail-recursive-delete path)))))

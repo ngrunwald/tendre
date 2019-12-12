@@ -29,7 +29,8 @@
   (transactional? [tm]))
 
 (defprotocol EnvTendreProtocol
-  (open-environment [this opts] "Opens an Environment"))
+  (open-environment [this opts] "Opens an Environment")
+  (get-store-names [this] [this transaction] "Returns the set of store names"))
 
 (def store-config
   {:with-duplicates-with-prefixing    StoreConfig/WITH_DUPLICATES_WITH_PREFIXING
@@ -178,10 +179,24 @@
 (extend-protocol EnvTendreProtocol
   String
   (open-environment [path _] (Environments/newInstance path))
+  (get-store-names [path _] (get-store-names path))
+  (get-store-names [path] (let [^Environment env (open-environment path {})]
+                            (transactional-read
+                             env
+                             (fn [trx] (into #{} (.getAllStoreNames env trx))))))
   Environment
   (open-environment [this _] this)
+  (get-store-names [this _] (get-store-names this))
+  (get-store-names [this] (transactional-read
+                             this
+                             (fn [trx] (into #{} (.getAllStoreNames this trx)))))
   java.io.File
-  (open-environment [path _] (Environments/newInstance path)))
+  (open-environment [path _] (Environments/newInstance path))
+  (get-store-names [path _] (get-store-names path))
+  (get-store-names [path] (let [^Environment env (open-environment path {})]
+                            (transactional-read
+                             env
+                             (fn [trx] (into #{} (.getAllStoreNames env trx)))))))
 
 (extend-protocol TransactionalTendreProtocol
   Transaction
@@ -294,6 +309,11 @@
                 transaction (open-store env transaction label)))
   EnvTendreProtocol
   (open-environment [_ _] env)
+  (get-store-names [_]
+    (transactional-read
+     env
+     (fn [trx] (into #{} (.getAllStoreNames env trx)))))
+  (get-store-names [this _] (get-store-names this))
   TransactionalTendreProtocol
   (get-transaction [_ transaction-type]
     (cond
