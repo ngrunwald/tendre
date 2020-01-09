@@ -1,14 +1,14 @@
 # tendre
 
-A Clojure library designed to ... well, that part is up to you.
+A Clojure wrapper around Jetbrains xodus to get a datastructure behaving like a transient hashmap but backed on disk.
 
 ## Usage
 
-FIXME
+See tests for now.
 
 ## License
 
-Copyright © 2019 FIXME
+Copyright © 2019 Nils Grunwald
 
 This program and the accompanying materials are made available under the
 terms of the Eclipse Public License 2.0 which is available at
